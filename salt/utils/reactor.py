@@ -4,7 +4,6 @@ from __future__ import absolute_import
 # Import python libs
 import fnmatch
 import glob
-import signal
 import logging
 
 import yaml
@@ -22,29 +21,34 @@ from salt._compat import string_types
 log = logging.getLogger(__name__)
 
 
-class Reactor(salt.utils.process.MultiprocessingProcess, salt.state.Compiler):
+class Reactor(salt.utils.process.SignalHandlingMultiprocessingProcess, salt.state.Compiler):
     '''
     Read in the reactor configuration variable and compare it to events
     processed on the master.
     The reactor has the capability to execute pre-programmed executions
     as reactions to events
     '''
-    def __init__(self, opts):
-        salt.utils.process.MultiprocessingProcess.__init__(self)
+    def __init__(self, opts, log_queue=None):
+        super(Reactor, self).__init__(log_queue=log_queue)
         local_minion_opts = opts.copy()
         local_minion_opts['file_client'] = 'local'
         self.minion = salt.minion.MasterMinion(local_minion_opts)
         salt.state.Compiler.__init__(self, opts, self.minion.rend)
 
-    def sig_stop(self, signum, frame):
-        msg = 'Received a '
-        if signum == signal.SIGINT:
-            msg += 'SIGINT'
-        elif signum == signal.SIGTERM:
-            msg += 'SIGTERM'
-        msg += '. Exiting {0}.'.format(self.__class__.__name__)
-        log.info(msg)
-        exit(salt.defaults.exitcodes.EX_GENERIC)
+    # We need __setstate__ and __getstate__ to avoid pickling errors since
+    # 'self.rend' (from salt.state.Compiler) contains a function reference
+    # which is not picklable.
+    # These methods are only used when pickling so will not be used on
+    # non-Windows platforms.
+    def __setstate__(self, state):
+        self._is_child = True
+        Reactor.__init__(
+            self, state['opts'],
+            log_queue=state['log_queue'])
+
+    def __getstate__(self):
+        return {'opts': self.opts,
+                'log_queue': self.log_queue}
 
     def render_reaction(self, glob_ref, tag, data):
         '''
@@ -54,9 +58,11 @@ class Reactor(salt.utils.process.MultiprocessingProcess, salt.state.Compiler):
         react = {}
 
         if glob_ref.startswith('salt://'):
-            glob_ref = self.minion.functions['cp.cache_file'](glob_ref)
-
-        for fn_ in glob.glob(glob_ref):
+            glob_ref = self.minion.functions['cp.cache_file'](glob_ref) or ''
+        globbed_ref = glob.glob(glob_ref)
+        if not globbed_ref:
+            log.error('Can not render SLS {0} for tag {1}. File missing or not found.'.format(glob_ref, tag))
+        for fn_ in globbed_ref:
             try:
                 res = self.render_template(
                     fn_,
@@ -197,15 +203,11 @@ class Reactor(salt.utils.process.MultiprocessingProcess, salt.state.Compiler):
         '''
         Enter into the server loop
         '''
-        # Properly exit if a SIGTERM/SIGINT is signalled
-        signal.signal(signal.SIGTERM, self.sig_stop)
-        signal.signal(signal.SIGINT, self.sig_stop)
-
         salt.utils.appendproctitle(self.__class__.__name__)
 
         # instantiate some classes inside our new process
         self.event = salt.utils.event.get_event(
-                'master',
+                self.opts['__role'],
                 self.opts['sock_dir'],
                 self.opts['transport'],
                 opts=self.opts,
@@ -264,7 +266,7 @@ class ReactWrap(object):
     def run(self, low):
         '''
         Execute the specified function in the specified state by passing the
-        LowData
+        low data
         '''
         l_fun = getattr(self, low['state'])
         try:
@@ -273,9 +275,9 @@ class ReactWrap(object):
 
             # TODO: Setting the user doesn't seem to work for actual remote publishes
             if low['state'] in ('runner', 'wheel'):
-                # TODO: pick one...
+                # Update called function's low data with event user to
+                # segregate events fired by reactor and avoid reaction loops
                 kwargs['__user__'] = self.event_user
-                kwargs['user'] = self.event_user
 
             l_fun(*f_call.get('args', ()), **kwargs)
         except Exception:
@@ -305,6 +307,13 @@ class ReactWrap(object):
         '''
         if 'runner' not in self.client_cache:
             self.client_cache['runner'] = salt.runner.RunnerClient(self.opts)
+            # The len() function will cause the module functions to load if
+            # they aren't already loaded. We want to load them so that the
+            # spawned threads don't need to load them. Loading in the spawned
+            # threads creates race conditions such as sometimes not finding
+            # the required function because another thread is in the middle
+            # of loading the functions.
+            len(self.client_cache['runner'].functions)
         try:
             self.pool.fire_async(self.client_cache['runner'].low, args=(fun, kwargs))
         except SystemExit:
@@ -318,6 +327,13 @@ class ReactWrap(object):
         '''
         if 'wheel' not in self.client_cache:
             self.client_cache['wheel'] = salt.wheel.Wheel(self.opts)
+            # The len() function will cause the module functions to load if
+            # they aren't already loaded. We want to load them so that the
+            # spawned threads don't need to load them. Loading in the spawned
+            # threads creates race conditions such as sometimes not finding
+            # the required function because another thread is in the middle
+            # of loading the functions.
+            len(self.client_cache['wheel'].functions)
         try:
             self.pool.fire_async(self.client_cache['wheel'].low, args=(fun, kwargs))
         except SystemExit:
@@ -330,7 +346,7 @@ class ReactWrap(object):
         Wrap Caller to enable executing :ref:`caller modules <all-salt.caller>`
         '''
         log.debug("in caller with fun {0} args {1} kwargs {2}".format(fun, args, kwargs))
-        args = kwargs['args']
+        args = kwargs.get('args', [])
         if 'caller' not in self.client_cache:
             self.client_cache['caller'] = salt.client.Caller(self.opts['conf_file'])
         try:

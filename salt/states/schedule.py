@@ -19,11 +19,11 @@ Management of the Salt scheduler
         - function: test.ping
         - seconds: 15
         - splay:
-            - start: 10
-            - end: 20
+            start: 10
+            end: 20
 
-    This will schedule the command: test.ping every 3600 seconds
-    (every hour) splaying the time between 10 and 20 seconds
+    This will schedule the command: test.ping every 15 seconds
+    splaying the time between 10 and 20 seconds
 
     job1:
       schedule.present:
@@ -59,9 +59,9 @@ Management of the Salt scheduler
     job1:
       schedule.present:
         - function: state.sls
-        - args:
+        - job_args:
           - httpd
-        - kwargs:
+        - job_kwargs:
             test: True
         - when:
             - Monday 5:00pm
@@ -116,6 +116,10 @@ def present(name,
         This will schedule the job at the specified time(s)
         using the crontab format.
         Requires python-croniter.
+
+    run_on_start
+        Whether the job will run when Salt minion start.  Value should be
+        a boolean.
 
     function
         The function that should be executed by the scheduled job.

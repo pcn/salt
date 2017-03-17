@@ -6,7 +6,7 @@ Proxmox Cloud Module
 .. versionadded:: 2014.7.0
 
 The Proxmox cloud module is used to control access to cloud providers using
-the Proxmox system (KVM / OpenVZ).
+the Proxmox system (KVM / OpenVZ / LXC).
 
 Set up the cloud configuration at ``/etc/salt/cloud.providers`` or
  ``/etc/salt/cloud.providers.d/proxmox.conf``:
@@ -322,7 +322,7 @@ def get_resources_vms(call=None, resFilter=None, includeConfig=True):
 
     ret = {}
     for resource in resources:
-        if 'type' in resource and resource['type'] in ['openvz', 'qemu']:
+        if 'type' in resource and resource['type'] in ['openvz', 'qemu', 'lxc']:
             name = resource['name']
             ret[name] = resource
 
@@ -503,27 +503,20 @@ def create(vm_):
         # Check for required profile parameters before sending any API calls.
         if vm_['profile'] and config.is_profile_configured(__opts__,
                                                            __active_provider_name__ or 'proxmox',
-                                                           vm_['profile']) is False:
+                                                           vm_['profile'],
+                                                           vm_=vm_) is False:
             return False
     except AttributeError:
         pass
 
-    # Since using "provider: <provider-engine>" is deprecated, alias provider
-    # to use driver: "driver: <provider-engine>"
-    if 'provider' in vm_:
-        vm_['driver'] = vm_.pop('provider')
-
     ret = {}
 
-    salt.utils.cloud.fire_event(
+    __utils__['cloud.fire_event'](
         'event',
         'starting create',
         'salt/cloud/{0}/creating'.format(vm_['name']),
-        {
-            'name': vm_['name'],
-            'profile': vm_['profile'],
-            'provider': vm_['driver'],
-        },
+        args=__utils__['cloud.filter_event']('creating', vm_, ['name', 'profile', 'provider', 'driver']),
+        sock_dir=__opts__['sock_dir'],
         transport=__opts__['transport']
     )
 
@@ -557,7 +550,7 @@ def create(vm_):
 
     ret['creation_data'] = data
     name = vm_['name']        # hostname which we know
-    if (vm_['clone']) is True:
+    if 'clone' in vm_ and vm_['clone'] is True:
         vmid = newid
     else:
         vmid = data['vmid']       # vmid which we have received
@@ -603,7 +596,7 @@ def create(vm_):
 
     vm_['ssh_host'] = ip_address
     vm_['password'] = ssh_password
-    ret = salt.utils.cloud.bootstrap(vm_, __opts__)
+    ret = __utils__['cloud.bootstrap'](vm_, __opts__)
 
     # Report success!
     log.info('Created Cloud VM \'{0[name]}\''.format(vm_))
@@ -613,15 +606,12 @@ def create(vm_):
         )
     )
 
-    salt.utils.cloud.fire_event(
+    __utils__['cloud.fire_event'](
         'event',
         'created instance',
         'salt/cloud/{0}/created'.format(vm_['name']),
-        {
-            'name': vm_['name'],
-            'profile': vm_['profile'],
-            'provider': vm_['driver'],
-        },
+        args=__utils__['cloud.filter_event']('created', vm_, ['name', 'profile', 'provider', 'driver']),
+        sock_dir=__opts__['sock_dir'],
     )
 
     return ret
@@ -636,8 +626,9 @@ def create_node(vm_, newid):
     if 'technology' not in vm_:
         vm_['technology'] = 'openvz'  # default virt tech if none is given
 
-    if vm_['technology'] not in ['qemu', 'openvz']:
+    if vm_['technology'] not in ['qemu', 'openvz', 'lxc']:
         # Wrong VM type given
+        log.error('Wrong VM type. Valid options are: qemu, openvz (proxmox3) or lxc (proxmox4)')
         raise SaltCloudExecutionFailure
 
     if 'host' not in vm_:
@@ -668,6 +659,32 @@ def create_node(vm_, newid):
         for prop in 'cpus', 'disk', 'ip_address', 'nameserver', 'password', 'swap', 'poolid', 'storage':
             if prop in vm_:  # if the property is set, use it for the VM request
                 newnode[prop] = vm_[prop]
+
+    elif vm_['technology'] == 'lxc':
+        # LXC related settings, using non-default names:
+        newnode['hostname'] = vm_['name']
+        newnode['ostemplate'] = vm_['image']
+
+        for prop in 'cpuunits', 'description', 'memory', 'onboot', 'net0', 'password', 'nameserver', 'swap', 'storage', 'rootfs':
+            if prop in vm_:  # if the property is set, use it for the VM request
+                newnode[prop] = vm_[prop]
+
+        # inform user the "disk" option is not supported for LXC hosts
+        if 'disk' in vm_:
+            log.warning('The "disk" option is not supported for LXC hosts and was ignored')
+
+        # LXC specific network config
+        # OpenVZ allowed specifying IP and gateway. To ease migration from
+        # Proxmox 3, I've mapped the ip_address and gw to a generic net0 config.
+        # If you need more control, please use the net0 option directly.
+        # This also assumes a /24 subnet.
+        if 'ip_address' in vm_ and 'net0' not in vm_:
+            newnode['net0'] = 'bridge=vmbr0,ip=' + vm_['ip_address'] + '/24,name=eth0,type=veth'
+
+            # gateway is optional and does not assume a default
+            if 'gw' in vm_:
+                newnode['net0'] = newnode['net0'] + ',gw=' + vm_['gw']
+
     elif vm_['technology'] == 'qemu':
         # optional Qemu settings
         for prop in 'acpi', 'cores', 'cpu', 'pool', 'storage', 'sata0', 'ostype', 'ide2', 'net0':
@@ -675,16 +692,19 @@ def create_node(vm_, newid):
                 newnode[prop] = vm_[prop]
 
     # The node is ready. Lets request it to be added
-    salt.utils.cloud.fire_event(
+    __utils__['cloud.fire_event'](
         'event',
         'requesting instance',
         'salt/cloud/{0}/requesting'.format(vm_['name']),
-        {'kwargs': newnode},
+        args={
+            'kwargs': __utils__['cloud.filter_event']('requesting', newnode, newnode.keys()),
+        },
+        sock_dir=__opts__['sock_dir'],
     )
 
     log.debug('Preparing to generate a node using these parameters: {0} '.format(
               newnode))
-    if vm_['clone'] is True and vm_['technology'] == 'qemu':
+    if 'clone' in vm_ and vm_['clone'] is True and vm_['technology'] == 'qemu':
         postParams = {}
         postParams['newid'] = newnode['vmid']
 
@@ -708,7 +728,7 @@ def show_instance(name, call=None):
         )
 
     nodes = list_nodes_full()
-    salt.utils.cloud.cache_node(nodes[name], __active_provider_name__, __opts__)
+    __utils__['cloud.cache_node'](nodes[name], __active_provider_name__, __opts__)
     return nodes[name]
 
 
@@ -793,11 +813,12 @@ def destroy(name, call=None):
             '-a or --action.'
         )
 
-    salt.utils.cloud.fire_event(
+    __utils__['cloud.fire_event'](
         'event',
         'destroying instance',
         'salt/cloud/{0}/destroying'.format(name),
-        {'name': name},
+        args={'name': name},
+        sock_dir=__opts__['sock_dir'],
         transport=__opts__['transport']
     )
 
@@ -811,18 +832,23 @@ def destroy(name, call=None):
         if not wait_for_state(vmobj['vmid'], 'stopped'):
             return {'Error': 'Unable to stop {0}, command timed out'.format(name)}
 
+        # required to wait a bit here, otherwise the VM is sometimes
+        # still locked and destroy fails.
+        time.sleep(1)
+
         query('delete', 'nodes/{0}/{1}'.format(
             vmobj['node'], vmobj['id']
         ))
-        salt.utils.cloud.fire_event(
+        __utils__['cloud.fire_event'](
             'event',
             'destroyed instance',
             'salt/cloud/{0}/destroyed'.format(name),
-            {'name': name},
+            args={'name': name},
+            sock_dir=__opts__['sock_dir'],
             transport=__opts__['transport']
         )
         if __opts__.get('update_cachedir', False) is True:
-            salt.utils.cloud.delete_minion_cachedir(name, __active_provider_name__.split(':')[0], __opts__)
+            __utils__['cloud.delete_minion_cachedir'](name, __active_provider_name__.split(':')[0], __opts__)
 
         return {'Destroyed': '{0} was destroyed.'.format(name)}
 

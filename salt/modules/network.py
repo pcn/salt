@@ -37,8 +37,7 @@ def __virtual__():
     '''
     # Disable on Windows, a specific file module exists:
     if salt.utils.is_windows():
-        return False
-
+        return (False, 'The network execution module cannot be loaded on Windows: use win_network instead.')
     return True
 
 
@@ -379,20 +378,29 @@ def _netstat_route_linux():
 
 def _netstat_route_freebsd():
     '''
-    Return netstat routing information for FreeBSD and OS X
+    Return netstat routing information for FreeBSD and macOS
     '''
     ret = []
     cmd = 'netstat -f inet -rn | tail -n+5'
     out = __salt__['cmd.run'](cmd, python_shell=True)
     for line in out.splitlines():
         comps = line.split()
-        ret.append({
-            'addr_family': 'inet',
-            'destination': comps[0],
-            'gateway': comps[1],
-            'netmask': comps[2],
-            'flags': comps[3],
-            'interface': comps[5]})
+        if __grains__['os'] == 'FreeBSD' and int(__grains__.get('osmajorrelease', 0)) < 10:
+            ret.append({
+                'addr_family': 'inet',
+                'destination': comps[0],
+                'gateway': comps[1],
+                'netmask': comps[2],
+                'flags': comps[3],
+                'interface': comps[5]})
+        else:
+            ret.append({
+                'addr_family': 'inet',
+                'destination': comps[0],
+                'gateway': comps[1],
+                'netmask': '',
+                'flags': comps[2],
+                'interface': comps[3]})
     cmd = 'netstat -f inet6 -rn | tail -n+5'
     out = __salt__['cmd.run'](cmd, python_shell=True)
     for line in out.splitlines():
@@ -482,7 +490,7 @@ def _netstat_route_sunos():
             'gateway': comps[1],
             'netmask': '',
             'flags': comps[2],
-            'interface': comps[5]})
+            'interface': comps[5] if len(comps) >= 6 else ''})
     cmd = 'netstat -f inet6 -rn | tail -n+5'
     out = __salt__['cmd.run'](cmd, python_shell=True)
     for line in out.splitlines():
@@ -493,7 +501,7 @@ def _netstat_route_sunos():
             'gateway': comps[1],
             'netmask': '',
             'flags': comps[2],
-            'interface': comps[5]})
+            'interface': comps[5] if len(comps) >= 6 else ''})
     return ret
 
 
@@ -528,7 +536,11 @@ def netstat():
 
 def active_tcp():
     '''
-    Return a dict containing information on all of the running TCP connections
+    Return a dict containing information on all of the running TCP connections (currently linux and solaris only)
+
+    .. versionchanged:: 2015.8.4
+
+        Added support for SunOS
 
     CLI Example:
 
@@ -536,7 +548,25 @@ def active_tcp():
 
         salt '*' network.active_tcp
     '''
-    return salt.utils.network.active_tcp()
+    if __grains__['kernel'] == 'Linux':
+        return salt.utils.network.active_tcp()
+    elif __grains__['kernel'] == 'SunOS':
+        # lets use netstat to mimic linux as close as possible
+        ret = {}
+        for connection in _netstat_sunos():
+            if not connection['proto'].startswith('tcp'):
+                continue
+            if connection['state'] != 'ESTABLISHED':
+                continue
+            ret[len(ret)+1] = {
+                'local_addr': '.'.join(connection['local-address'].split('.')[:-1]),
+                'local_port': '.'.join(connection['local-address'].split('.')[-1:]),
+                'remote_addr': '.'.join(connection['remote-address'].split('.')[:-1]),
+                'remote_port': '.'.join(connection['remote-address'].split('.')[-1:])
+            }
+        return ret
+    else:
+        return {}
 
 
 def traceroute(host):
@@ -655,6 +685,7 @@ def traceroute(host):
     return ret
 
 
+@decorators.which('dig')
 def dig(host):
     '''
     Performs a DNS lookup with dig
@@ -818,7 +849,7 @@ def convert_cidr(cidr):
     '''
     returns the network and subnet mask of a cidr addr
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     CLI Example:
 
@@ -853,13 +884,14 @@ def calc_net(ip_addr, netmask=None):
     return salt.utils.network.calc_net(ip_addr, netmask)
 
 
-def ip_addrs(interface=None, include_loopback=False, cidr=None):
+def ip_addrs(interface=None, include_loopback=False, cidr=None, type=None):
     '''
     Returns a list of IPv4 addresses assigned to the host. 127.0.0.1 is
     ignored, unless 'include_loopback=True' is indicated. If 'interface' is
     provided, then only IP addresses from that interface will be returned.
     Providing a CIDR via 'cidr="10.0.0.0/8"' will return only the addresses
-    which are within that subnet.
+    which are within that subnet. If 'type' is 'public', then only public
+    addresses will be returned. Ditto for 'type'='private'.
 
     CLI Example:
 
@@ -872,7 +904,13 @@ def ip_addrs(interface=None, include_loopback=False, cidr=None):
     if cidr:
         return [i for i in addrs if salt.utils.network.in_subnet(cidr, [i])]
     else:
-        return addrs
+        if type == 'public':
+            return [i for i in addrs if not is_private(i)]
+        elif type == 'private':
+            return [i for i in addrs if is_private(i)]
+        else:
+            return addrs
+
 
 ipaddrs = salt.utils.alias_function(ip_addrs, 'ipaddrs')
 
@@ -894,7 +932,7 @@ def ip_addrs6(interface=None, include_loopback=False, cidr=None):
     addrs = salt.utils.network.ip_addrs6(interface=interface,
                                         include_loopback=include_loopback)
     if cidr:
-        return [i for i in addrs if salt.utils.network.ip_in_subnet(cidr, [i])]
+        return [i for i in addrs if salt.utils.network.in_subnet(cidr, [i])]
     else:
         return addrs
 
@@ -912,8 +950,21 @@ def get_hostname():
         salt '*' network.get_hostname
     '''
 
-    from socket import gethostname
-    return gethostname()
+    return socket.gethostname()
+
+
+def get_fqdn():
+    '''
+    Get fully qualified domain name
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' network.get_fqdn
+    '''
+
+    return socket.getfqdn()
 
 
 def mod_hostname(hostname):
@@ -946,26 +997,32 @@ def mod_hostname(hostname):
         uname_cmd = '/usr/bin/uname' if salt.utils.is_smartos() else salt.utils.which('uname')
         check_hostname_cmd = salt.utils.which('check-hostname')
 
-    if hostname_cmd.endswith('hostnamectl'):
-        __salt__['cmd.run']('{0} set-hostname {1}'.format(hostname_cmd, hostname))
-        return True
-
     # Grab the old hostname so we know which hostname to change and then
     # change the hostname using the hostname command
-    if not salt.utils.is_sunos():
-        o_hostname = __salt__['cmd.run']('{0} -f'.format(hostname_cmd))
+    if hostname_cmd.endswith('hostnamectl'):
+        out = __salt__['cmd.run']('{0} status'.format(hostname_cmd))
+        for line in out.splitlines():
+            line = line.split(':')
+            if 'Static hostname' in line[0]:
+                o_hostname = line[1].strip()
+    elif not salt.utils.is_sunos():
+        # don't run hostname -f because -f is not supported on all platforms
+        o_hostname = socket.getfqdn()
     else:
         # output: Hostname core OK: fully qualified as core.acheron.be
         o_hostname = __salt__['cmd.run'](check_hostname_cmd).split(' ')[-1]
 
-    if not salt.utils.is_sunos():
+    if hostname_cmd.endswith('hostnamectl'):
+        __salt__['cmd.run']('{0} set-hostname {1}'.format(hostname_cmd, hostname))
+    elif not salt.utils.is_sunos():
         __salt__['cmd.run']('{0} {1}'.format(hostname_cmd, hostname))
     else:
         __salt__['cmd.run']('{0} -S {1}'.format(uname_cmd, hostname.split('.')[0]))
 
     # Modify the /etc/hosts file to replace the old hostname with the
     # new hostname
-    host_c = salt.utils.fopen('/etc/hosts', 'r').readlines()
+    with salt.utils.fopen('/etc/hosts', 'r') as fp_:
+        host_c = fp_.readlines()
 
     with salt.utils.fopen('/etc/hosts', 'w') as fh_:
         for host in host_c:
@@ -984,7 +1041,8 @@ def mod_hostname(hostname):
     # Modify the /etc/sysconfig/network configuration file to set the
     # new hostname
     if __grains__['os_family'] == 'RedHat':
-        network_c = salt.utils.fopen('/etc/sysconfig/network', 'r').readlines()
+        with salt.utils.fopen('/etc/sysconfig/network', 'r') as fp_:
+            network_c = fp_.readlines()
 
         with salt.utils.fopen('/etc/sysconfig/network', 'w') as fh_:
             for net in network_c:
@@ -992,7 +1050,7 @@ def mod_hostname(hostname):
                     fh_.write('HOSTNAME={0}\n'.format(hostname))
                 else:
                     fh_.write(net)
-    elif __grains__['os_family'] == 'Debian':
+    elif __grains__['os_family'] in ('Debian', 'NILinuxRT'):
         with salt.utils.fopen('/etc/hostname', 'w') as fh_:
             fh_.write(hostname + '\n')
     elif __grains__['os_family'] == 'OpenBSD':
@@ -1073,7 +1131,12 @@ def connect(host, port=None, **kwargs):
          _proto,
          garbage,
          _address) = socket.getaddrinfo(address, port, __family, 0, __proto)[0]
+    except socket.gaierror:
+        ret['result'] = False
+        ret['comment'] = 'Unable to resolve host {0} on {1} port {2}'.format(host, proto, port)
+        return ret
 
+    try:
         skt = socket.socket(family, socktype, _proto)
         skt.settimeout(timeout)
 
@@ -1179,13 +1242,13 @@ def _get_bufsize_linux(iface):
 
 def get_bufsize(iface):
     '''
-    Return network buffer sizes as a dict
+    Return network buffer sizes as a dict (currently linux only)
 
     CLI Example:
 
     .. code-block:: bash
 
-        salt '*' network.getbufsize
+        salt '*' network.get_bufsize eth0
     '''
     if __grains__['kernel'] == 'Linux':
         if os.path.exists('/sbin/ethtool'):
@@ -1231,7 +1294,7 @@ def mod_bufsize(iface, *args, **kwargs):
 
     .. code-block:: bash
 
-        salt '*' network.getBuffers
+        salt '*' network.mod_bufsize tx=<val> rx=<val> rx-mini=<val> rx-jumbo=<val>
     '''
     if __grains__['kernel'] == 'Linux':
         if os.path.exists('/sbin/ethtool'):
@@ -1309,6 +1372,8 @@ def default_route(family=None):
     for route in _routes:
         if family:
             if route['destination'] in default_route[family]:
+                if __grains__['kernel'] == 'SunOS' and route['addr_family'] != family:
+                    continue
                 ret.append(route)
         else:
             if route['destination'] in default_route['inet'] or \
@@ -1415,3 +1480,49 @@ def get_route(ip):
 
     else:
         raise CommandExecutionError('Not yet supported on this platform')
+
+
+def ifacestartswith(cidr):
+    '''
+    Retrieve the interface name from a specific CIDR
+
+    .. versionadded:: 2016.11.0
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' network.ifacestartswith 10.0
+    '''
+    net_list = interfaces()
+    intfnames = []
+    pattern = str(cidr)
+    size = len(pattern)
+    for ifname, ifval in six.iteritems(net_list):
+        if 'inet' in ifval:
+            for inet in ifval['inet']:
+                if inet['address'][0:size] == pattern:
+                    if 'label' in inet:
+                        intfnames.append(inet['label'])
+                    else:
+                        intfnames.append(ifname)
+    return intfnames
+
+
+def iphexval(ip):
+    '''
+    Retrieve the interface name from a specific CIDR
+
+    .. versionadded:: 2016.11.0
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' network.iphexval 10.0.0.1
+    '''
+    a = ip.split('.')
+    hexval = ""
+    for val in a:
+        hexval = ''.join([hexval, hex(int(val))[2:].zfill(2)])
+    return hexval.upper()

@@ -5,6 +5,7 @@ Execute puppet routines
 
 # Import python libs
 from __future__ import absolute_import
+from distutils import version  # pylint: disable=no-name-in-module
 import logging
 import os
 import datetime
@@ -16,7 +17,7 @@ from salt.exceptions import CommandExecutionError
 # Import 3rd-party libs
 import yaml
 import salt.ext.six as six
-
+from salt.ext.six.moves import range
 log = logging.getLogger(__name__)
 
 
@@ -64,10 +65,17 @@ class _Puppet(object):
             self.vardir = 'C:\\ProgramData\\PuppetLabs\\puppet\\var'
             self.rundir = 'C:\\ProgramData\\PuppetLabs\\puppet\\run'
             self.confdir = 'C:\\ProgramData\\PuppetLabs\\puppet\\etc'
+            self.useshell = True
         else:
-            if 'Enterprise' in __salt__['cmd.run']('puppet --version'):
+            self.useshell = False
+            self.puppet_version = __salt__['cmd.run']('puppet --version')
+            if 'Enterprise' in self.puppet_version:
                 self.vardir = '/var/opt/lib/pe-puppet'
                 self.rundir = '/var/opt/run/pe-puppet'
+                self.confdir = '/etc/puppetlabs/puppet'
+            elif self.puppet_version != [] and version.StrictVersion(self.puppet_version) >= version.StrictVersion('4.0.0'):
+                self.vardir = '/opt/puppetlabs/puppet/cache'
+                self.rundir = '/var/run/puppetlabs'
                 self.confdir = '/etc/puppetlabs/puppet'
             else:
                 self.vardir = '/var/lib/puppet'
@@ -143,20 +151,22 @@ def run(*args, **kwargs):
     '''
     puppet = _Puppet()
 
-    if args:
+    # new args tuple to filter out agent/apply for _Puppet.arguments()
+    buildargs = ()
+    for arg in range(len(args)):
         # based on puppet documentation action must come first. making the same
         # assertion. need to ensure the list of supported cmds here matches
         # those defined in _Puppet.arguments()
-        if args[0] in ['agent', 'apply']:
-            puppet.subcmd = args[0]
-            puppet.arguments(args[1:])
-    else:
-        # args will exist as an empty list even if none have been provided
-        puppet.arguments(args)
+        if args[arg] in ['agent', 'apply']:
+            puppet.subcmd = args[arg]
+        else:
+            buildargs += (args[arg],)
+    # args will exist as an empty list even if none have been provided
+    puppet.arguments(buildargs)
 
     puppet.kwargs.update(salt.utils.clean_kwargs(**kwargs))
 
-    ret = __salt__['cmd.run_all'](repr(puppet), python_shell=False)
+    ret = __salt__['cmd.run_all'](repr(puppet), python_shell=puppet.useshell)
     if ret['retcode'] in [0, 2]:
         ret['retcode'] = 0
     else:
@@ -225,7 +235,7 @@ def disable(message=None):
     .. code-block:: bash
 
         salt '*' puppet.disable
-        salt '*' puppet.disable 'disabled for a good reason'
+        salt '*' puppet.disable 'Disabled, contact XYZ before enabling'
     '''
 
     puppet = _Puppet()

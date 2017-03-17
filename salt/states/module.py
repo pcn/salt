@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-'''
+r'''
 Execution of Salt modules from within states
 ============================================
 
@@ -15,7 +15,7 @@ state:
 
 Note that this example is probably unnecessary to use in practice, since the
 ``mine_functions`` and ``mine_interval`` config parameters can be used to
-schedule updates for the mine (see :doc:`here </topics/mine/index>` for more
+schedule updates for the mine (see :ref:`here <salt-mine>` for more
 info).
 
 It is sometimes desirable to trigger a function call after a state is executed,
@@ -47,10 +47,12 @@ argument, to avoid a collision with the ``name`` argument.
 
 Here is a list of keywords hidden by the state system, which must be prefixed
 with ``m_``:
+
 * fun
 * name
 * names
 * state
+* saltenv
 
 For example:
 
@@ -74,21 +76,38 @@ arguments. For example:
 
 .. code-block:: yaml
 
-cloud.create:
-  module.run:
-  - func: cloud.create
-  - provider: test-provider
-  - m_names:
-    - test-vlad
-  - kwargs: {
-        ssh_username: 'ubuntu',
-        image: 'ami-8d6d9daa',
-        securitygroup: 'default',
-        size: 'c3.large',
-        location: 'ap-northeast-1',
-        delvol_on_destroy: 'True'
-    }
+    cloud.create:
+      module.run:
+        - func: cloud.create
+        - provider: test-provider
+        - m_names:
+          - test-vlad
+        - kwargs: {
+              ssh_username: 'ubuntu',
+              image: 'ami-8d6d9daa',
+              securitygroup: 'default',
+              size: 'c3.large',
+              location: 'ap-northeast-1',
+              delvol_on_destroy: 'True'
+          }
 
+Another example that creates a recurring task that runs a batch file on a
+Windows system:
+
+.. code-block:: yaml
+
+    eventsviewer:
+      module.run:
+        - name: task.create_task
+        - m_name: 'events-viewer'
+        - user_name: System
+        - kwargs: {
+              action_type: 'Execute',
+              cmd: 'c:\netops\scripts\events_viewer.bat',
+              trigger_type: 'Daily',
+              start_date: '2017-1-20',
+              start_time: '11:59PM'
+        }
 '''
 from __future__ import absolute_import
 
@@ -114,11 +133,11 @@ def wait(name, **kwargs):
         return ``True`` but not actually execute, unless one of the following
         two things happens:
 
-        1. The state has a :doc:`watch requisite </ref/states/requisites>`, and
+        1. The state has a :ref:`watch requisite <requisites-watch>`, and
            the state which it is watching changes.
 
-        2. Another state has a :doc:`watch_in requisite
-           </ref/states/requisites>` which references this state, and the state
+        2. Another state has a :ref:`watch_in requisite
+           <requisites-watch-in>` which references this state, and the state
            wth the ``watch_in`` changes.
     '''
     return {'name': name,
@@ -140,7 +159,7 @@ def run(name, **kwargs):
     ``returner``
         Specify the returner to send the return of the module execution to
 
-    ``**kwargs``
+    ``kwargs``
         Pass any arguments needed to execute the function
     '''
     ret = {'name': name,
@@ -182,6 +201,9 @@ def run(name, **kwargs):
         elif arg == 'state':
             if 'm_state' in kwargs:
                 defaults[arg] = kwargs.pop('m_state')
+        elif arg == 'saltenv':
+            if 'm_saltenv' in kwargs:
+                defaults[arg] = kwargs.pop('m_saltenv')
         if arg in kwargs:
             defaults[arg] = kwargs.pop(arg)
     missing = set()
@@ -194,6 +216,8 @@ def run(name, **kwargs):
             rarg = 'm_names'
         elif arg == 'state':
             rarg = 'm_state'
+        elif arg == 'saltenv':
+            rarg = 'm_saltenv'
         else:
             rarg = arg
         if rarg not in kwargs and arg not in defaults:
@@ -265,8 +289,11 @@ def run(name, **kwargs):
         ret['result'] = mret
     else:
         changes_ret = ret['changes'].get('ret', {})
-        if isinstance(changes_ret, dict) and changes_ret.get('retcode', 0) != 0:
-            ret['result'] = False
+        if isinstance(changes_ret, dict):
+            if isinstance(changes_ret.get('result', {}), bool):
+                ret['result'] = changes_ret.get('result', {})
+            elif changes_ret.get('retcode', 0) != 0:
+                ret['result'] = False
     return ret
 
 mod_watch = salt.utils.alias_function(run, 'mod_watch')
